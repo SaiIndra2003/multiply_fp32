@@ -35,7 +35,7 @@ You will also need an **Anthropic API key** (for calling the AI agent). Email yo
 
 Fork the task repository to your own GitHub account, then clone your fork:
 
-1. Go to [https://github.com/phinitylabs/multiply_fp32](https://github.com/phinitylabs/multiply_fp32) and click **Fork**. Make sure the fork has **public** visibility.
+1. Go to [https://github.com/phinitylabs/multiply_fp32](https://github.com/phinitylabs/multiply_fp32) and click **Fork**. Make sure the fork has **public** visibility. Remember to **uncheck** `Copy main branch only` when creating the fork.
 2. Clone your fork:
 
 ```bash
