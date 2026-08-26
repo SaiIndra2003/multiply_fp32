@@ -1,6 +1,85 @@
-Complete the given partial Systemverilog RTL code based on the specification doc/spec.md. The RTL code should be synthesizable.
-Make sure that the name of the files match with the following:
-- Top:        multiply_fp32.sv
+You are given a partial SystemVerilog RTL implementation of a single-precision floating-point multiplier and a specification document `spec.md` that fully describes the intended behavior.
 
+Your task:
+- Complete the given partial SystemVerilog RTL code so that it fully matches the behavior described in `spec.md`.
+- The final top-level file must be named `multiply_fp32.sv`.
+- The top module name must be `fmultiplier`.
 
-**Important**: This environment uses Icarus Verilog for testing. Avoid using SystemVerilog Assertion (SVA) property/sequence syntax if adding assertions.$
+Functional requirements (from spec.md):
+- Implement a multi-cycle, single-issue FP32 multiplier: z = a * b.
+- Use a valid/out_valid handshake:
+  * `valid` is a 1-cycle start pulse, accepted only when the unit is idle.
+  * While busy, new `valid` pulses are ignored.
+  * On completion, `z` is updated, `out_valid` pulses high for 1 cycle, and busy is cleared.
+- Fixed latency: 7 clock cycles from the start edge (when `valid` is sampled while idle) to the cycle where `out_valid` asserts.
+- Throughput: 1 result per 7 cycles (not pipelined, single-issue).
+- Correct IEEE-754 round-to-nearest-even (RNE) for normal numbers.
+- Special-case handling (must be implemented):
+  * If either operand is ±0, result must be ±0 with sign = signA ^ signB.
+  * If one operand is ±Inf and the other is a non-zero finite number, result must be ±Inf with sign = signA ^ signB.
+  * NaNs may be left unspecified for this grade band, but the design must not lock up.
+- Primary operating mode: inputs are normal (exp in [1..254]), but zero and infinity encodings must still be detected and handled as above.
+
+FSM / pipeline structure:
+- Implement the 7 stages using a counter (1..7) inside a single `always_ff` block:
+  1. UNPACK
+  2. SPECIAL_CLASSIFY
+  3. NORMALIZE_INPUTS
+  4. MUL_CORE
+  5. EXTRACT_ROUND_BITS
+  6. NORMALIZE_ROUND
+  7. PACK
+- Each `case(counter)` block must have a comment with the stage name and a 1–2 line description of what it does, matching the stage descriptions in `spec.md`.
+- Use internal registers `a_r`, `b_r` to capture `a` and `b` when `valid` is accepted.
+- Use internal signals as described in `spec.md`:
+  * `a_s, b_s, z_s` for signs
+  * `a_e, b_e, z_e` for unbiased exponents (10-bit signed, used with $signed)
+  * `a_m, b_m, z_m` for 24-bit mantissas (with hidden 1 for normals)
+  * `product` (50-bit) for mantissa multiplication
+  * `guard_bit`, `round_bit`, `sticky` for RNE rounding
+
+Code style and documentation:
+- Add a header comment block at the top of `multiply_fp32.sv` that includes:
+  * Brief description of the module.
+  * Latency (7 cycles) and throughput (1 result per 7 cycles).
+  * Supported input domain (normals, with basic zero/inf handling).
+  * Author and date placeholders.
+- Use consistent naming as in `spec.md`:
+  * `a_r`, `b_r` for registered inputs
+  * `a_s`, `b_s`, `z_s` for signs
+  * `a_e`, `b_e`, `z_e` for unbiased exponents
+  * `a_m`, `b_m`, `z_m` for 24-bit mantissas
+  * `guard_bit`, `round_bit`, `sticky` for rounding bits
+- The main datapath and FSM must be synthesizable.
+
+Configurability:
+- Add the following parameter:
+  * `parameter STRICT_NORMAL_ONLY = 1;`
+- Use this parameter in `if` conditions around special-case logic:
+  * When `STRICT_NORMAL_ONLY == 1`, you may assume inputs are primarily normal, but must still correctly handle zero and infinity as specified.
+  * When `STRICT_NORMAL_ONLY == 0`, the structure for full special-case classification (zero, inf, NaN) should be present (can be partially stubbed, but the gating with this parameter must exist).
+
+Simulation-only runtime checks (no SVA):
+- Add simple procedural checks (using `$display` / `$error`) to help catch misuse during simulation. These must be:
+  * Non-synthesizable (guarded by `ifndef SYNTHESIS`).
+  * Free of SystemVerilog Assertion (SVA) property/sequence syntax.
+- Examples of checks to include:
+  * Warning if `valid` is asserted while `busy`:
+    - `if (busy && valid) $display("%0t: WARNING: valid asserted while busy; ignored.", $time);`
+  * Error if `out_valid` is asserted when `counter != 7`:
+    - `if (out_valid && (counter != 4'd7)) $error("%0t: ERROR: out_valid asserted at counter=%0d", $time, counter);`
+- These checks must not affect synthesis and must not use SVA syntax.
+
+Toolchain constraints:
+- The environment uses Icarus Verilog for simulation.
+- Do NOT use SystemVerilog Assertion (SVA) property/sequence syntax.
+- Keep the code compatible with Icarus (basic SystemVerilog features only; no advanced SVA).
+
+Output:
+- Generate only the complete SystemVerilog code for `multiply_fp32.sv` with module name `fmultiplier`.
+- Ensure the implementation matches the behavior and structure described in `spec.md`, including:
+  * FSM / Pipeline Stages
+  * Assumptions & Constraints
+  * Code Style and Documentation Requirements
+  * Runtime Checks (Simulation Only)
+  * Configurability
