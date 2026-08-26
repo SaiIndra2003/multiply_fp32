@@ -1,19 +1,6 @@
-Complete the given partial SystemVerilog RTL code based on the specification doc/spec.md. The RTL code should be synthesizable.
+Complete the given partial Systemverilog RTL code based on the specification doc/spec.md. The RTL code should be synthesizable.
 Make sure that the name of the files match with the following:
 - Top:        multiply_fp32.sv
 
-**Important**: This environment uses Icarus Verilog for testing. Avoid using SystemVerilog Assertion (SVA) property/sequence syntax if adding assertions.
 
-Additional requirements:
-- Implement a multi-cycle, single-issue FP32 multiplier: z = a * b, with fixed 7-cycle latency from valid (when idle) to out_valid.
-- Use a valid/out_valid handshake: valid is a 1-cycle start pulse accepted only when idle; while busy, new valid pulses are ignored; on completion, z is updated, out_valid pulses for 1 cycle, and busy is cleared.
-- Correct IEEE-754 round-to-nearest-even (RNE) for normal numbers.
-- Implement the 7 stages (UNPACK, SPECIAL_CLASSIFY, NORMALIZE_INPUTS, MUL_CORE, EXTRACT_ROUND_BITS, NORMALIZE_ROUND, PACK) using a counter (1..7) in a single always_ff block; each case(counter) block must have a comment with the stage name and a 1–2 line description.
-- Add a header comment block with: brief description, latency (7 cycles), throughput (1 per 7 cycles), supported input domain (normals), and author/date placeholders.
-- Use consistent signal names: a_r, b_r, a_s, b_s, z_s, a_e, b_e, z_e, a_m, b_m, z_m, guard_bit, round_bit, sticky.
-- Add parameter: `parameter STRICT_NORMAL_ONLY = 1;` and use it in if-conditions around special-case logic.
-- Add simulation-only procedural checks (guarded by `ifndef SYNTHESIS`) for:
-  * valid asserted while busy (warning),
-  * out_valid asserted when counter != 7 (error).
-- Do NOT use SystemVerilog Assertion (SVA) property/sequence syntax.
-- Generate only the complete SystemVerilog code for `multiply_fp32.sv` with module name `fmultiplier`.
+**Important**: This environment uses Icarus Verilog for testing. Avoid using SystemVerilog Assertion (SVA) property/sequence syntax if adding assertions.$
