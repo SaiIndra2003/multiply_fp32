@@ -133,22 +133,19 @@ All stage actions are performed inside a single sequential always block using `c
 
 
 ### Stage 6 — Normalize + Round-to-Nearest-Even (RNE)
-This stage performs, **in this exact order**:
-
+This stage performs:
 1. **Underflow alignment** toward exponent -126:
    - Computes shift amount `sh = (-126 - z_e)` when `z_e < -126`.
    - Shifts mantissa right and accumulates shifted-out bits into sticky.
-
 2. **Normalize** if MSB missing:
    - Left-shifts mantissa while adjusting exponent, carrying guard into LSB.
-
 3. **RNE rounding**:
-   - If `guard_bit == 1` and `(round_bit || sticky || z_m[0])` then increment mantissa.
+   - If `G == 1` and `(R || S || LSB)` then increment mantissa.
    - Handles carry-out from rounding:
-     - If rounding overflows mantissa, set mantissa to `0x800000` and increment exponent.
+     - If rounding overflows mantissa, set mantissa to 0x800000 and increment exponent.
 
 
-> **Implementation note (mandatory):** These three sub-steps are *sequentially dependent* — the
+> **Implementation note:** These three sub-steps are *sequentially dependent* — the
 > normalize step must see the *result* of the underflow-alignment step, and the
 > rounding step must see the *result* of the normalize step, all within the same
 > clock cycle. If you implement this stage as three separate `if` blocks using
@@ -159,7 +156,7 @@ This stage performs, **in this exact order**:
 > operand.
 >
 > A reliable pattern: declare local variables (e.g. `temp_mantissa`, `temp_guard`,
-> `temp_round`, `temp_sticky`, `temp_exp`) at the top of this stage, use **blocking
+> `temp_round`, `temp_sticky`) at the top of this stage, use **blocking
 > assignments (`=`)** to carry values through the underflow → normalize → round
 > sub-steps in order, and only use a **non-blocking assignment (`<=`)** once, at
 > the very end of the stage, to commit the final computed value into the actual
