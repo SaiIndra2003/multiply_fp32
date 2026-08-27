@@ -1,360 +1,313 @@
-# FP32 Multiplier Specification
+# fmultiplier — FP32 Multiplier (Handshake, Multi-Cycle, IEEE-754)
 
-## 1. Overview
+## Overview
 
-Implement a multi-cycle single-precision floating-point multiplier.
+`fmultiplier` is a **multi-cycle** single-precision floating-point multiplier that accepts one operation at a time using a **valid/out_valid** handshake. Internally it runs a staged pipeline controlled by a small FSM (`counter`) and produces a 32-bit IEEE-754 binary32 result.
 
-The module performs:
+This design targets:
 
-    z = a * b
+- **Bit-accurate results for normal FP32 numbers** (IEEE-754 round-to-nearest-even),
+- Deterministic latency (fixed number of cycles from `valid` to `out_valid`),
+- Functional behavior:  
+  \[
+  z = a \times b
+  \]
+  where `z`, `a`, and `b` are 32-bit IEEE-754 single-precision numbers.
 
-where `a`, `b`, and `z` are IEEE-754 binary-32 values.
-
-The implementation must be synthesizable.
-
-The design accepts one operation at a time and uses a valid/busy/out_valid
-handshake.
-
-The primary correctness criteria are:
-
-- Correct results for normal FP32 operands.
-- Correct handling of signed zero.
-- Correct overflow to infinity.
-- Correct treatment of results at the smallest normal exponent.
-- Exact 7-cycle latency and correct handshake.
+In addition to normal × normal multiplication, the implementation should provide **basic handling for zeros and infinities** to demonstrate understanding of IEEE-754 special cases.
 
 ---
 
-# 2. Module Interface
+## Interface
 
-Module name:
+### Ports
 
-    fmultiplier
+| Port        | Dir | Width | Description                                      |
+|------------|-----|-------|--------------------------------------------------|
+| `clk`      | in  | 1     | Clock                                            |
+| `rst`      | in  | 1     | Async reset (posedge)                            |
+| `valid`    | in  | 1     | **1-cycle start pulse**; accepted only when idle |
+| `a`        | in  | 32    | Operand A (FP32 bits)                            |
+| `b`        | in  | 32    | Operand B (FP32 bits)                            |
+| `z`        | out | 32    | Result (FP32 bits)                               |
+| `out_valid`| out | 1     | **1-cycle pulse** when `z` is updated/valid      |
 
-Ports:
+### Handshake contract
 
-| Port       | Direction | Width | Description |
-|------------|-----------|-------|-------------|
-| clk        | input     | 1     | Clock |
-| rst        | input     | 1     | Asynchronous active-high reset |
-| valid      | input     | 1     | One-cycle operation request |
-| a          | input     | 32    | FP32 operand A |
-| b          | input     | 32    | FP32 operand B |
-| z          | output    | 32    | FP32 result |
-| out_valid  | output    | 1     | One-cycle result-valid pulse |
+- When `busy == 0`, a high `valid` on a rising clock edge **starts** an operation:
+  - `a` and `b` are **registered** into internal regs `a_r` and `b_r`.
+  - The FSM begins at `counter = 1`.
+- While `busy == 1`, new `valid` pulses are **ignored**.
+- When the operation completes:
+  - `z` is updated,
+  - `out_valid` pulses high for 1 clock cycle,
+  - `busy` is cleared.
 
-Do not change the module name or any port.
-
----
-
-# 3. Reset Behavior
-
-`rst` is asynchronous and active-high.
-
-When `rst == 1`:
-
-- busy must be cleared.
-- out_valid must be cleared.
-- z must be reset to a defined value (e.g., 0).
-- internal state must be reset.
-- no operation may be considered active.
-
-After reset is released, the module must be ready to accept a new operation.
+The module may expose `busy` internally; it does not need to be a top-level port.
 
 ---
 
-# 4. Handshake
+## Latency and Throughput
 
-An operation is accepted only when:
+### Latency
 
-    busy == 0
-    valid == 1
+- Fixed latency of **7 stages**.
+- The operation begins at stage `counter = 1` and completes at `counter = 7`.
+- `out_valid` asserts on the cycle where stage 7 packing finishes.
 
-On the rising edge where the operation is accepted:
+System-level expectation:
 
-- capture `a` into an internal register,
-- capture `b` into an internal register,
-- assert busy,
-- begin the multi-cycle operation.
+- **`out_valid` occurs 7 clock cycles after the start edge** (the edge where `valid` was sampled when idle).
 
-Once the operation starts:
+### Throughput
 
-- changes to external `a` and `b` must not affect the current operation.
-- additional `valid` pulses while busy must be ignored.
-- the current operation must continue until completion.
+- **Not pipelined** (single-issue).
+- Maximum throughput: **1 result per 7 cycles** (assuming `valid` is asserted only when idle).
 
 ---
 
-# 5. Latency
+## Internal Data Model (IEEE-754 binary32)
 
-The multiplier has a fixed latency of 7 clock cycles.
+For each operand:
 
-For every accepted operation:
+- `sign` = bit 31  
+- `exp`  = bits 30:23 (biased exponent, bias = 127)  
+- `mant` = bits 22:0 (fraction)
 
-    valid accepted
-          |
-          | 7 clock cycles
-          v
-    out_valid == 1
+Internal signals:
 
-`out_valid` must be asserted for exactly one clock cycle.
-
-When `out_valid == 1`, `z` must contain the result corresponding to the
-accepted operands.
-
----
-
-# 6. FP32 Representation
-
-The 32-bit FP32 representation is:
-
-    [31]      Sign
-    [30:23]   Exponent
-    [22:0]    Fraction
-
-For normal numbers:
-
-    value = (-1)^sign × 1.fraction × 2^(exponent - 127)
-
-The hidden leading bit must be included when constructing the mantissa.
-
-For a normal operand:
-
-    mantissa = {1'b1, fraction}
-
-Therefore the mantissa width is 24 bits.
+- `a_s, b_s, z_s`: sign bits  
+- `a_e, b_e, z_e`: signed exponent in *unbiased* domain (stored as 10-bit regs, used with `$signed`)  
+- `a_m, b_m, z_m`: mantissas extended to 24-bit with hidden 1 when applicable  
+- `product`: 50-bit product of mantissas  
+- `guard_bit`, `round_bit`, `sticky`: rounding support bits for round-to-nearest-even (RNE)
 
 ---
 
-# 7. Sign Calculation
+## FSM / Pipeline Stages
 
-The result sign is:
+The FSM is controlled by:
 
-    result_sign = sign_a XOR sign_b
+- `busy` (operation in progress)  
+- `counter` (stage number 1..7)
 
-This applies to normal operands and signed zero.
+All stage actions are performed inside a single sequential `always_ff` block using `case(counter)`.
 
----
+The 7 stages must be **clearly visible in the code**, with comments indicating the stage name and purpose:
 
-# 8. Exponent Calculation
+1. `// Stage 1 — UNPACK`
+2. `// Stage 2 — SPECIAL_CLASSIFY`
+3. `// Stage 3 — NORMALIZE_INPUTS`
+4. `// Stage 4 — MUL_CORE`
+5. `// Stage 5 — EXTRACT_ROUND_BITS`
+6. `// Stage 6 — NORMALIZE_ROUND`
+7. `// Stage 7 — PACK`
 
-Extract the unbiased exponent from each normal operand:
+### Stage 1 — Unpack
 
-    a_e = exponent_a - 127
-    b_e = exponent_b - 127
+- Extract mantissas into 24-bit regs (initially `{1'b0, frac}`).
+- Convert biased exponent into unbiased form:  
+  \[
+  a\_e = \text{expA} - 127,\quad b\_e = \text{expB} - 127
+  \]
+- Capture signs `a_s`, `b_s`.
 
-The multiplier must calculate the intermediate exponent exactly as follows:
+### Stage 2 — Special classification + denormal setup
 
-    z_e = a_e + b_e
+- Classify operands using flags derived from `a_r`/`b_r`:
+  - `a_is_zero`, `b_is_zero`
+  - `a_is_inf`, `b_is_inf`
+  - `a_is_nan`, `b_is_nan` (optional for this grade band)
+- For **normal operation**:
+  - If exponent ≠ 0 ⇒ set implicit leading 1: `a_m[23] = 1`, `b_m[23] = 1`.
+- For **subnormal inputs** (if ever enabled):
+  - If exponent = 0 ⇒ force exponent to −126 (subnormal baseline) and handle mantissa without implicit 1.
 
-The implementation must NOT add an additional bias adjustment at this stage.
+> For the primary use case (normal-only inputs):
+> - `expA` and `expB` are in [1..254],
+> - hidden-one insertion always happens,
+> - special-case logic is effectively bypassed except for zero/inf detection.
 
-Normalization may modify `z_e` when required by the mantissa product.
+### Stage 3 — Input normalization (lightweight)
 
-The final FP32 biased exponent is:
+- If mantissa MSB is not set, shift left and decrement exponent.
+- Mainly relevant for denormal handling; for strictly normal inputs, this typically does nothing.
 
-    biased_exponent = z_e + 127
+### Stage 4 — Multiply core
 
----
+- Compute result sign:  
+  \[
+  z\_s = a\_s \oplus b\_s
+  \]
+- Exponent add:  
+  \[
+  z\_e = a\_e + b\_e + 1
+  \]
+- Mantissa product:  
+  \[
+  \text{product} = a\_m \times b\_m \times 4
+  \]
+  The `*4` scaling aligns the product for extraction into `{z_m, G, R, S}`.
 
-# 9. Mantissa Multiplication
+### Stage 5 — Extract mantissa + rounding bits
 
-For normal operands:
+- Mantissa bits:  
+  \[
+  z\_m = \text{product}[49:26]
+  \]
+- Rounding bits:
+  - `guard_bit = product[25]`
+  - `round_bit = product[24]`
+  - `sticky = OR(product[23:0])`
 
-    a_m = {1'b1, fraction_a}
-    b_m = {1'b1, fraction_b}
+### Stage 6 — Normalize + Round-to-Nearest-Even (RNE)
 
-Multiply:
+This stage performs:
 
-    product = a_m * b_m
+1. **Underflow alignment** toward exponent −126:
+   - If `z_e < -126`:
+     - Compute shift amount:  
+       \[
+       sh = -126 - z\_e
+       \]
+     - Shift mantissa right by `sh`, accumulating shifted-out bits into `sticky`.
 
-The full multiplication result must be retained with sufficient width.
-`a_m` and `b_m` are 24 bits each, so `product` requires 48 bits.
+2. **Normalization** if MSB missing:
+   - Left-shift mantissa while adjusting exponent, carrying guard into LSB as needed.
 
-Do not truncate the multiplication before normalization/rounding.
+3. **RNE rounding**:
+   - Round up if:  
+     \[
+     G = 1 \ \text{and}\ (R \lor S \lor \text{LSB}) = 1
+     \]
+   - If rounding overflows mantissa:
+     - Set mantissa to `0x800000` (i.e., 1.0 in fixed-point form).
+     - Increment exponent.
 
----
+### Stage 7 — Pack
 
-# 10. Normalization
+- For the **normal path**:
+  - Convert unbiased exponent back to biased:  
+    \[
+    \text{expZ} = z\_e + 127
+    \]
+  - Pack:
+    - `z[31] = z_s`
+    - `z[30:23] = expZ`
+    - `z[22:0] = z_m[22:0]`
+  - If exponent indicates **overflow** ⇒ output ±Inf with correct sign.
+  - If exponent indicates exact denormal boundary ⇒ force exponent field to 0 (denormal/zero representation).
 
-The product of two normalized 24-bit mantissas is in the range:
+- **Special-case overrides** (must be implemented):
+  - If either operand is zero:
+    - Result = ±0 with `z_s = a_s ^ b_s`.
+  - If one operand is ±Inf and the other is non-zero finite:
+    - Result = ±Inf with `z_s = a_s ^ b_s`.
+  - NaNs:
+    - For this grade band, it is acceptable to treat NaNs as “unspecified” as long as the design does not lock up.
+    - If both inputs are normal and the mathematical result overflows, output ±Inf with correct sign.
 
-    [1.0, 4.0)
-
-Therefore:
-
-- if the product is >= 2.0, shift the mantissa right by one bit and increment
-  the exponent by one.
-- otherwise retain the mantissa position.
-
-The normalization decision must be based on the actual product bits.
-
----
-
-# 11. Rounding
-
-The result must use round-to-nearest-even when rounding is required.
-
-The implementation must retain sufficient guard/round/sticky information
-before truncating the mantissa.
-
-If rounding causes the mantissa to overflow:
-
-    1.xxxxx -> 10.000...
-
-then normalize again and increment the exponent.
-
----
-
-# 12. Overflow
-
-If the final exponent exceeds the maximum representable normal FP32 exponent:
-
-    result = infinity
-
-The result must preserve the calculated sign.
-
-For positive overflow:
-
-    {1'b0, 8'hFF, 23'h000000}
-
-For negative overflow:
-
-    {1'b1, 8'hFF, 23'h000000}
-
----
-
-# 13. Underflow and Denormal Boundary
-
-The smallest normal unbiased exponent is:
-
-    -126
-
-Therefore:
-
-    z_e == -126
-
-is still a normal FP32 result.
-
-Only:
-
-    z_e < -126
-
-enters the underflow/denormal handling path.
-
-A result sitting exactly at `z_e == -126` must be packed as a normal number,
-with biased exponent field `1` and its computed fraction bits. Forcing the
-exponent field to zero for every result at or below -126 silently destroys
-these valid normal results.
-
-For `z_e < -126`, the implementation should:
-
-- shift the mantissa right as needed,
-- and produce either a subnormal or zero according to IEEE-754 rules.
-
-Exact bit-perfect subnormal behavior is desirable but not the primary focus;
-the key requirement is correct handling at the `z_e == -126` boundary.
+- Assert `out_valid` for one cycle and clear `busy`.
 
 ---
 
-# 14. Zero Handling
+## Assumptions & Constraints
 
-If either operand is zero:
+Primary operating mode:
 
-    result = signed zero
+- Inputs: `exp ∈ [1..254]` (normal numbers; no subnormals, no Inf/NaN required for basic correctness).
+- The design must still **detect** zero and infinity encodings and handle them as specified in Stage 7.
 
-The result sign is:
+Optional extended mode (for future work / higher grades):
 
-    sign_a XOR sign_b
-
-Examples:
-
-    +0 * +1 = +0
-    -0 * +1 = -0
-    +0 * -1 = -0
-    -0 * -1 = +0
-
-Zero operands must be correctly recognized even if other special-value
-handling is simplified.
+- Full handling of subnormals, all Inf/NaN combinations, and proper NaN payload propagation.
 
 ---
 
-# 15. Special Values
+## Code Style and Documentation Requirements
 
-Unless explicitly required elsewhere in this specification:
+The generated RTL (`multiply_fp32.sv`) must satisfy:
 
-- NaN handling is not required.
-- Infinity input handling is not required.
-- Subnormal input handling is not required.
-
-Operands are expected to be normal FP32 values with biased exponent in the
-range 1..254, plus signed zero.
-
-The implementation must not invent additional behavior that is not specified.
-
----
-
-# 16. Required Test Cases
-
-The verification environment must cover at least the following. These are the
-behaviors that determine correctness for this design — cover them well rather
-than maximizing the number of test cases.
-
-### Basic magnitudes
-
-    1.0 * 1.0 = 1.0
-    2.0 * 2.0 = 4.0
-    2.0 * 3.0 = 6.0
-    4.0 * 4.0 = 16.0
-    1.5 * 2.0 = 3.0
-    5.0 * 0.5 = 2.5
-
-### Fractional / rounding
-
-    0.5 * 0.5 = 0.25
-    0.75 * 0.75 = 0.5625
-    0.25 * 0.25 = 0.0625
-
-Include at least one operand pair whose exact product needs more than 24
-mantissa bits, so round-to-nearest-even is actually exercised.
-
-### Signs
-
-    (-1.0) * 1.0 = -1.0
-    (-1.0) * (-1.0) = 1.0
-    (-2.0) * 3.0 = -6.0
-
-### Boundary
-
-    largest normal * 1.0
-    an overflow-producing multiplication
-    a product landing at the smallest normal exponent (z_e == -126)
-
-### Handshake
-
-    result appears exactly 7 cycles after an accepted valid
-    out_valid asserted for exactly one cycle
-    valid ignored while busy
+- **Top module header comment block** including:
+  - Brief description of the module.
+  - Latency (7 cycles) and throughput (1 per 7 cycles).
+  - Supported input domain (normals, basic zero/inf handling).
+  - Author and date placeholders.
+- **Clear FSM implementation**:
+  - Use a `counter` (1..7) inside a single `always_ff` block.
+  - Each `case(counter)` block must have a comment with the stage name and a 1–2 line description.
+- **Consistent naming**:
+  - `a_r`, `b_r` for registered inputs.
+  - `a_s`, `b_s`, `z_s` for signs.
+  - `a_e`, `b_e`, `z_e` for unbiased exponents.
+  - `a_m`, `b_m`, `z_m` for 24-bit mantissas.
+  - `guard_bit`, `round_bit`, `sticky` for rounding.
+- **Synthesizable logic** for the main datapath and FSM.
+- **No SystemVerilog Assertion (SVA) property/sequence syntax** (Icarus Verilog is used for simulation).
 
 ---
 
-# 17. Reference Values
+## Runtime Checks (Simulation Only)
 
-Expected FP32 values MUST be independently verified.
+The design may include **procedural checks** for simulation (non-synthesizable), guarded by `ifndef SYNTHESIS`, such as:
 
-Expected values must not be changed to match an incorrect RTL implementation.
+- Warning if `valid` is asserted while `busy`:
+  ```systemverilog
+  if (busy && valid)
+      $display("%0t: WARNING: valid asserted while busy; ignored.", $time);
+  ```
+- Error if `out_valid` is asserted when `counter != 7`:
+  ```systemverilog
+  if (out_valid && (counter != 4'd7))
+      $error("%0t: ERROR: out_valid asserted at counter=%0d", $time, counter);
+  ```
+
+These checks should not affect synthesis and must not use SVA syntax.
 
 ---
 
-# 18. Verification Requirement
+## Configurability
 
-The implementation is considered correct only when:
+Add a parameter to allow future extension:
 
-- the RTL compiles,
-- all required tests pass,
-- latency is exactly 7 cycles,
-- handshake behavior is correct,
-- result bits match the expected FP32 values,
-- no module ports have been changed.
+```systemverilog
+parameter STRICT_NORMAL_ONLY = 1;
+```
 
-A partial pass is not considered completion.
+- When `STRICT_NORMAL_ONLY == 1`:
+  - The design may assume inputs are primarily normal.
+  - Special-case logic can be simplified but must still correctly handle:
+    - Zero operands.
+    - Infinity operands (when present).
+- When `STRICT_NORMAL_ONLY == 0`:
+  - Full special-case classification (zero, inf, NaN) is expected (can be left as a stub for this grade band, but structure must be present).
+
+The parameter must exist and be used in `if` conditions around special-case logic.
+
+---
+
+## Verification Notes
+
+Recommended testbench behavior:
+
+- Drive `a`/`b` and pulse `valid` **synchronously** on clock edges.
+- Wait for `out_valid` before sampling `z`.
+- For primary verification:
+  - Use **normal operands** (exp ∈ [1..254]).
+  - Optionally include some zero and infinity operands to verify special-case handling.
+- The testbench may skip cases where the mathematically correct result is subnormal.
+
+The provided Python/cocotb testbench should be compatible with this spec, with environment controls such as:
+
+- `ALLOW_NAN` (default: 0)
+- `ALLOW_INF` (can be set to 1 once Inf handling is implemented)
+- `SPECIAL_RATE` (fraction of special operands)
+
+---
+
+## File Naming
+
+- Top-level RTL file: **`multiply_fp32.sv`**
+- Top module name: **`fmultiplier`**
+
+These names must be used exactly to match the test environment.
