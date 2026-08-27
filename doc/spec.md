@@ -14,7 +14,13 @@ This design targets:
   \]
   where `z`, `a`, and `b` are 32-bit IEEE-754 single-precision numbers.
 
-In addition to normal × normal multiplication, the implementation should provide **basic handling for zeros and infinities** to demonstrate understanding of IEEE-754 special cases.
+The primary correctness criteria are:
+
+- Correct results for normal FP32 operands.
+- Correct handling of signed zero.
+- Correct overflow to infinity.
+- Correct treatment of results at the smallest normal exponent (z_e = −126).
+- Exact 7-cycle latency and correct handshake.
 
 ---
 
@@ -43,7 +49,7 @@ In addition to normal × normal multiplication, the implementation should provid
   - `out_valid` pulses high for 1 clock cycle,
   - `busy` is cleared.
 
-The module may expose `busy` internally; it does not need to be a top-level port.
+The module may implement `busy` internally; it does not need to be a top-level port.
 
 ---
 
@@ -79,7 +85,7 @@ Internal signals:
 - `a_s, b_s, z_s`: sign bits  
 - `a_e, b_e, z_e`: signed exponent in *unbiased* domain (stored as 10-bit regs, used with `$signed`)  
 - `a_m, b_m, z_m`: mantissas extended to 24-bit with hidden 1 when applicable  
-- `product`: 50-bit product of mantissas  
+- `product`: at least 48-bit product of mantissas (50-bit is acceptable)  
 - `guard_bit`, `round_bit`, `sticky`: rounding support bits for round-to-nearest-even (RNE)
 
 ---
@@ -105,33 +111,47 @@ The 7 stages must be **clearly visible in the code**, with comments indicating t
 
 ### Stage 1 — Unpack
 
-- Extract mantissas into 24-bit regs (initially `{1'b0, frac}`).
-- Convert biased exponent into unbiased form:  
-  \[
-  a\_e = \text{expA} - 127,\quad b\_e = \text{expB} - 127
-  \]
-- Capture signs `a_s`, `b_s`.
+- Extract fields from `a_r` and `b_r`:
+  - `a_s = a_r[31]`, `b_s = b_r[31]`
+  - `expA = a_r[30:23]`, `expB = b_r[30:23]`
+  - `fracA = a_r[22:0]`, `fracB = b_r[22:0]`
+- Convert biased exponents into unbiased form:
+  - `a_e = expA - 127`
+  - `b_e = expB - 127`
+- Initialize mantissas:
+  - `a_m = {1'b0, fracA}`
+  - `b_m = {1'b0, fracB}`
 
 ### Stage 2 — Special classification + denormal setup
 
 - Classify operands using flags derived from `a_r`/`b_r`:
   - `a_is_zero`, `b_is_zero`
-  - `a_is_inf`, `b_is_inf`
-  - `a_is_nan`, `b_is_nan` (optional for this grade band)
-- For **normal operation**:
-  - If exponent ≠ 0 ⇒ set implicit leading 1: `a_m[23] = 1`, `b_m[23] = 1`.
-- For **subnormal inputs** (if ever enabled):
-  - If exponent = 0 ⇒ force exponent to −126 (subnormal baseline) and handle mantissa without implicit 1.
+  - `a_is_inf`, `b_is_inf` (optional structure only; inputs are expected normal)
+  - `a_is_nan`, `b_is_nan` (optional structure only)
+- Classification rules:
+  - Zero: `exp == 0` and `mant == 0`.
+  - Infinity: `exp == 255` and `mant == 0`.
+  - NaN: `exp == 255` and `mant != 0`.
+- For **normal operands** (primary path):
+  - If exponent ≠ 0 ⇒ set implicit leading 1:
+    - `a_m[23] = 1`, `b_m[23] = 1`.
+- For **subnormal operands** (not required for primary tests, but structure may exist):
+  - If exponent = 0 and mantissa ≠ 0 ⇒ treat as subnormal:
+    - Force exponent to −126 (subnormal baseline).
+    - Do not set implicit leading 1.
 
-> For the primary use case (normal-only inputs):
-> - `expA` and `expB` are in [1..254],
-> - hidden-one insertion always happens,
-> - special-case logic is effectively bypassed except for zero/inf detection.
+> For the primary test mode:
+> - Operands are normal with `exp ∈ [1..254]`.
+> - Hidden-one insertion always happens.
+> - Special-case logic is structurally present but rarely exercised.
 
 ### Stage 3 — Input normalization (lightweight)
 
-- If mantissa MSB is not set, shift left and decrement exponent.
-- Mainly relevant for denormal handling; for strictly normal inputs, this typically does nothing.
+- If mantissa MSB is not set:
+  - Left-shift mantissa until MSB is 1 or exponent reaches −126.
+  - Decrement exponent for each left shift.
+- This ensures that both normal and (optionally) subnormal inputs are in a consistent normalized form before multiplication.
+- For strictly normal inputs with hidden 1 already set, this stage typically does nothing.
 
 ### Stage 4 — Multiply core
 
@@ -139,73 +159,147 @@ The 7 stages must be **clearly visible in the code**, with comments indicating t
   \[
   z\_s = a\_s \oplus b\_s
   \]
-- Exponent add:  
+- Exponent add (no extra bias here):  
   \[
-  z\_e = a\_e + b\_e + 1
+  z\_e = a\_e + b\_e
   \]
-- Mantissa product:  
-  \[
-  \text{product} = a\_m \times b\_m \times 4
-  \]
-  The `*4` scaling aligns the product for extraction into `{z_m, G, R, S}`.
+- Mantissa product:
+  - Use 24-bit mantissas:
+    - `a_m = {1'b1, fracA}` for normals
+    - `b_m = {1'b1, fracB}` for normals
+  - Compute:
+    \[
+    \text{product} = a\_m \times b\_m
+    \]
+  - `product` must be at least 48 bits wide; 50 bits is acceptable.
+- Do **not** add any extra bias adjustment in this stage beyond `z_e = a_e + b_e`.
+
+> Note: Some implementations scale the product (e.g., `*4`) and adjust later;
+> if you do so, ensure the net effect matches the standard FP multiplication
+> semantics and the normalization rules in Stage 6.
 
 ### Stage 5 — Extract mantissa + rounding bits
 
-- Mantissa bits:  
-  \[
-  z\_m = \text{product}[49:26]
-  \]
-- Rounding bits:
-  - `guard_bit = product[25]`
-  - `round_bit = product[24]`
-  - `sticky = OR(product[23:0])`
+- From the full product:
+  - Choose a 24-bit (or wider) intermediate mantissa window and rounding bits.
+  - A common pattern:
+    - `z_m = product[49:26]` (24 bits)
+    - `guard_bit = product[25]`
+    - `round_bit = product[24]`
+    - `sticky = OR(product[23:0])`
+- The exact bit indices may vary if you use a different internal scaling, but:
+  - You must retain enough bits to implement correct RNE.
+  - The combination `{z_m, guard_bit, round_bit, sticky}` must fully represent the rounded result.
 
 ### Stage 6 — Normalize + Round-to-Nearest-Even (RNE)
 
-This stage performs:
+This stage performs three logically sequential sub-steps:
 
-1. **Underflow alignment** toward exponent −126:
-   - If `z_e < -126`:
-     - Compute shift amount:  
-       \[
-       sh = -126 - z\_e
-       \]
-     - Shift mantissa right by `sh`, accumulating shifted-out bits into `sticky`.
+1. **Normalization of the product mantissa**
+2. **Underflow alignment** toward exponent −126
+3. **RNE rounding**
 
-2. **Normalization** if MSB missing:
-   - Left-shift mantissa while adjusting exponent, carrying guard into LSB as needed.
+These sub-steps are **sequentially dependent**:
 
-3. **RNE rounding**:
-   - Round up if:  
-     \[
-     G = 1 \ \text{and}\ (R \lor S \lor \text{LSB}) = 1
-     \]
-   - If rounding overflows mantissa:
-     - Set mantissa to `0x800000` (i.e., 1.0 in fixed-point form).
-     - Increment exponent.
+- Normalization must see the initial product mantissa.
+- Underflow alignment must see the result of normalization.
+- Rounding must see the result of underflow alignment.
 
-### Stage 7 — Pack
+**Implementation note (critical):**  
+If you implement these sub-steps using multiple `if` blocks with non-blocking assignments (`<=`) on the same signals (`z_m`, `guard_bit`, `round_bit`, `sticky`, `z_e`), each block will read the **pre-cycle** register value, not the updated value from the previous sub-step. This silently produces wrong results whenever more than one sub-step is needed for the same operand.
 
-- For the **normal path**:
-  - Convert unbiased exponent back to biased:  
+A reliable pattern:
+
+- Declare local variables at the top of this stage, e.g.:
+  - `logic [49:0] temp_product;`
+  - `logic [23:0] temp_mantissa;`
+  - `logic temp_guard, temp_round, temp_sticky;`
+  - `logic signed [9:0] temp_exp;`
+- Use **blocking assignments (`=`)** to carry values through:
+  - normalization → underflow alignment → rounding.
+- Use a **single non-blocking assignment (`<=`)** at the end of the stage to commit:
+  - `z_m <= temp_mantissa;`
+  - `guard_bit <= temp_guard;`
+  - `round_bit <= temp_round;`
+  - `sticky <= temp_sticky;`
+  - `z_e <= temp_exp;`
+
+#### 6.1 Normalization
+
+- The product of two 24-bit mantissas is in the range `[1.0, 4.0)`.
+- If the product is ≥ 2.0:
+  - Shift the mantissa right by 1 bit.
+  - Increment `z_e` by 1.
+- Otherwise, keep the mantissa position unchanged.
+
+#### 6.2 Underflow alignment
+
+- The smallest normal unbiased exponent is:
+  - `-126`
+- If `z_e < -126`:
+  - Compute shift amount:
     \[
-    \text{expZ} = z\_e + 127
+    sh = -126 - z\_e
     \]
-  - Pack:
-    - `z[31] = z_s`
-    - `z[30:23] = expZ`
-    - `z[22:0] = z_m[22:0]`
-  - If exponent indicates **overflow** ⇒ output ±Inf with correct sign.
-  - If exponent indicates exact denormal boundary ⇒ force exponent field to 0 (denormal/zero representation).
+  - Shift the mantissa right by `sh`.
+  - Accumulate shifted-out bits into `sticky`.
+  - Set `z_e = -126`.
+- If `z_e >= -126`, no underflow alignment is needed.
 
-- **Special-case overrides** (must be implemented):
-  - If either operand is zero:
-    - Result = ±0 with `z_s = a_s ^ b_s`.
-  - If one operand is ±Inf and the other is non-zero finite:
-    - Result = ±Inf with `z_s = a_s ^ b_s`.
-  - NaNs:
-    - For this grade band, it is acceptable to treat NaNs as “unspecified” as long as the design does not lock up.
-    - If both inputs are normal and the mathematical result overflows, output ±Inf with correct sign.
+#### 6.3 RNE rounding
+
+- After normalization and underflow alignment:
+  - Let `LSB = z_m[0]`.
+  - Round up if:
+    \[
+    guard\_bit = 1 \ \text{and}\ (round\_bit \lor sticky \lor LSB) = 1
+    \]
+- If rounding up:
+  - `z_m = z_m + 1`.
+  - If this causes mantissa overflow (e.g., `24'b111...1 + 1` → `24'b1_000...0`):
+    - Set `z_m` to `24'd1 << 23` (i.e., `1.0` in fixed-point form).
+    - Increment `z_e` by 1.
+
+---
+
+## Stage 7 — Pack
+
+- Compute biased exponent:
+  \[
+  \text{expZ} = z\_e + 127
+  \]
+
+- **Special-case priority** (evaluate before normal packing):
+
+  1. **Zero cases**:
+     - If either operand is zero and no infinity is involved:
+       - Result is ±0 with `z_s = a_s ^ b_s`.
+       - Output: `{z_s, 31'd0}`.
+
+  2. **Overflow**:
+     - If `expZ >= 255`:
+       - Output ±Inf with `z_s`:
+         - `{z_s, 8'd255, 23'd0}`.
+
+  3. **Normal vs denormal boundary**:
+     - If `z_e == -126` (i.e., `expZ == 1`):
+       - This is still a **normal** number.
+       - Pack as:
+         - `exp = 1`
+         - `fraction = z_m[22:0]`.
+     - Do **not** force the exponent field to 0 for results at `z_e == -126`.
+
+  4. **Underflow to subnormal/zero**:
+     - If `z_e < -126` after alignment:
+       - Produce either a subnormal or zero according to IEEE-754 rules.
+       - Exact bit-perfect subnormal behavior is desirable but secondary to:
+         - correct handling at `z_e == -126`,
+         - correct overflow and zero behavior.
+
+- **Normal packing** (when no special case above applies and `1 <= expZ <= 254`):
+  - `z[31] = z_s`
+  - `z[30:23] = expZ[7:0]`
+  - `z[22:0] = z_m[22:0]`
 
 - Assert `out_valid` for one cycle and clear `busy`.
 
@@ -213,14 +307,16 @@ This stage performs:
 
 ## Assumptions & Constraints
 
-Primary operating mode:
-
-- Inputs: `exp ∈ [1..254]` (normal numbers; no subnormals, no Inf/NaN required for basic correctness).
-- The design must still **detect** zero and infinity encodings and handle them as specified in Stage 7.
-
-Optional extended mode (for future work / higher grades):
-
-- Full handling of subnormals, all Inf/NaN combinations, and proper NaN payload propagation.
+- Primary operating mode:
+  - Inputs are **normal FP32 values** with biased exponent in `[1..254]`, plus signed zero.
+  - NaN/Inf/subnormal **inputs** are not required for primary correctness.
+- The implementation must:
+  - Correctly handle normal × normal → normal/inf/zero/subnormal as per IEEE-754.
+  - Correctly handle:
+    - Zero × finite → zero (with correct sign).
+    - Overflow → infinity (with correct sign).
+    - Results at `z_e == -126` as normal numbers.
+- Minor deviations in rare subnormal corner cases are acceptable, but the design must not lock up or produce completely incorrect encodings.
 
 ---
 
@@ -231,7 +327,7 @@ The generated RTL (`multiply_fp32.sv`) must satisfy:
 - **Top module header comment block** including:
   - Brief description of the module.
   - Latency (7 cycles) and throughput (1 per 7 cycles).
-  - Supported input domain (normals, basic zero/inf handling).
+  - Supported input domain (normals with correct zero/overflow/−126 boundary behavior).
   - Author and date placeholders.
 - **Clear FSM implementation**:
   - Use a `counter` (1..7) inside a single `always_ff` block.
@@ -243,7 +339,7 @@ The generated RTL (`multiply_fp32.sv`) must satisfy:
   - `a_m`, `b_m`, `z_m` for 24-bit mantissas.
   - `guard_bit`, `round_bit`, `sticky` for rounding.
 - **Synthesizable logic** for the main datapath and FSM.
-- **No SystemVerilog Assertion (SVA) property/sequence syntax** (Icarus Verilog is used for simulation).
+- **No SystemVerilog Assertion (SVA) property/sequence syntax**.
 
 ---
 
@@ -266,42 +362,18 @@ These checks should not affect synthesis and must not use SVA syntax.
 
 ---
 
-## Configurability
+## Verification Expectations
 
-Add a parameter to allow future extension:
-
-```systemverilog
-parameter STRICT_NORMAL_ONLY = 1;
-```
-
-- When `STRICT_NORMAL_ONLY == 1`:
-  - The design may assume inputs are primarily normal.
-  - Special-case logic can be simplified but must still correctly handle:
-    - Zero operands.
-    - Infinity operands (when present).
-- When `STRICT_NORMAL_ONLY == 0`:
-  - Full special-case classification (zero, inf, NaN) is expected (can be left as a stub for this grade band, but structure must be present).
-
-The parameter must exist and be used in `if` conditions around special-case logic.
-
----
-
-## Verification Notes
-
-Recommended testbench behavior:
-
-- Drive `a`/`b` and pulse `valid` **synchronously** on clock edges.
-- Wait for `out_valid` before sampling `z`.
-- For primary verification:
-  - Use **normal operands** (exp ∈ [1..254]).
-  - Optionally include some zero and infinity operands to verify special-case handling.
-- The testbench may skip cases where the mathematically correct result is subnormal.
-
-The provided Python/cocotb testbench should be compatible with this spec, with environment controls such as:
-
-- `ALLOW_NAN` (default: 0)
-- `ALLOW_INF` (can be set to 1 once Inf handling is implemented)
-- `SPECIAL_RATE` (fraction of special operands)
+- The design should produce correct IEEE-754 results for:
+  - Normal × normal operands across a wide range of exponent and mantissa values.
+  - Combinations involving:
+    - ±0
+    - Overflow to ±Inf
+    - Results at the smallest normal exponent (`z_e == -126`).
+- Subnormal outputs may occur for very small results; approximate but sensible behavior is acceptable as long as:
+  - The `z_e == -126` boundary is correct.
+  - Overflow and zero behavior are correct.
+- Minor deviations in rare subnormal corner cases are acceptable.
 
 ---
 
@@ -310,4 +382,4 @@ The provided Python/cocotb testbench should be compatible with this spec, with e
 - Top-level RTL file: **`multiply_fp32.sv`**
 - Top module name: **`fmultiplier`**
 
-These names must be used exactly to match the test environment.
+These names must be used exactly to match the integration environment.
