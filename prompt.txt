@@ -1,6 +1,11 @@
-Complete the given partial Systemverilog RTL code based on the specification doc/spec.md. The RTL code should be synthesizable.
+Complete the given partial SystemVerilog RTL code based on the specification doc/spec.md. The RTL code should be synthesizable.
 Make sure that the name of the files match with the following:
 - Top:        multiply_fp32.sv
 
+**Important**: This environment uses Icarus Verilog for testing. Avoid using SystemVerilog Assertion (SVA) property/sequence syntax if adding assertions.
 
-**Important**: This environment uses Icarus Verilog for testing. Avoid using SystemVerilog Assertion (SVA) property/sequence syntax if adding assertions.$
+Additional requirements:
+- Faithfully implement the 7-stage FSM and all formulas exactly as in spec.md (including z_e = a_e + b_e + 1 and product = a_m * b_m * 4).
+- In Stage 6, follow the implementation note: use local variables and blocking assignments for the underflow → normalize → round sub-steps, and a single non-blocking assignment to commit the final values.
+- Keep the design focused on normal × normal multiplication as described in spec.md; do not add extra special-case behavior beyond what the spec requires.
+- Generate only the complete SystemVerilog code for `multiply_fp32.sv` with module name `fmultiplier`.
